@@ -1,0 +1,87 @@
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+EDGE_PATH = ROOT / "tumor_graph_k20" / "tumor_edges.csv"
+OUT_DIR = ROOT / "tumor_graph_k20"
+
+edges = pd.read_csv(EDGE_PATH)
+
+G = nx.from_pandas_edgelist(
+    edges,
+    source="gene_i",
+    target="gene_j",
+    edge_attr="weight",
+    create_using=nx.Graph()
+)
+
+# =========================
+# Basic Graph Info
+# =========================
+print("Nodes:", G.number_of_nodes())
+print("Edges:", G.number_of_edges())
+print("Connected:", nx.is_connected(G))
+print("Average degree:", sum(dict(G.degree()).values()) / G.number_of_nodes())
+
+# =========================
+# Sanity Metrics
+# =========================
+deg = np.array([d for _, d in G.degree()])
+print("Min degree:", deg.min())
+print("Median degree:", np.median(deg))
+print("Max degree:", deg.max())
+print("Graph density:", nx.density(G))
+print("Average clustering (weighted):", nx.average_clustering(G, weight="weight"))
+
+# =========================
+# Save Graph Files
+# =========================
+nx.write_gexf(G, OUT_DIR / "tumor_graph_k20.gexf")
+nx.write_graphml(G, OUT_DIR / "tumor_graph_k20.graphml")
+print("Saved GEXF and GraphML files.")
+
+# =========================
+# Full Graph Plot (dense)
+# =========================
+plt.figure(figsize=(12,12))
+pos = nx.spring_layout(G, seed=42, k=0.15)
+
+nx.draw_networkx_nodes(G, pos, node_size=10)
+nx.draw_networkx_edges(G, pos, width=0.3, alpha=0.3)
+
+plt.axis("off")
+plt.savefig(OUT_DIR / "tumor_graph_k20_full.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print("Full graph image saved.")
+
+# =========================
+# Readable Plot (Top edges only)
+# =========================
+TOP_EDGES = 3000  # adjust between 1500–5000 if needed
+
+edges_sorted = edges.sort_values("weight", ascending=False).head(TOP_EDGES)
+
+H = nx.from_pandas_edgelist(
+    edges_sorted,
+    source="gene_i",
+    target="gene_j",
+    edge_attr="weight",
+    create_using=nx.Graph()
+)
+
+plt.figure(figsize=(12,12))
+pos = nx.spring_layout(H, seed=42, k=0.2)
+
+nx.draw_networkx_nodes(H, pos, node_size=12)
+nx.draw_networkx_edges(H, pos, width=0.4, alpha=0.35)
+
+plt.axis("off")
+plt.savefig(OUT_DIR / "tumor_graph_k20_topEdges.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print("Readable top-edges graph saved.")
+

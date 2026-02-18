@@ -1,0 +1,40 @@
+import pandas as pd
+
+# =============================
+# FILES
+# =============================
+TUMOR_FILE = "Tumor_expression_matrix_COSMIC.csv"
+HEALTHY_FILE = "Healthy_expression_matrix_COSMIC.csv"
+
+OUT_TUMOR_CORR = "Tumor_Spearman_GeneCorrelation.csv"
+OUT_HEALTHY_CORR = "Healthy_Spearman_GeneCorrelation.csv"
+
+
+def compute_spearman_gene_correlation(input_file, output_file):
+    print(f"\nLoading {input_file}...")
+
+    # Gene is index column
+    df = pd.read_csv(input_file, index_col=0)
+
+    print(f"Matrix shape (genes x samples): {df.shape}")
+
+    # Spearman correlation across genes
+    # Need to transpose so samples are rows
+    print("Computing Spearman correlation...")
+    corr_matrix = df.T.corr(method="spearman")
+
+    print(f"Correlation matrix shape: {corr_matrix.shape}")
+
+    print(f"Saving -> {output_file}")
+    corr_matrix.to_csv(output_file)
+
+    print("Done.\n")
+
+
+def main():
+    compute_spearman_gene_correlation(TUMOR_FILE, OUT_TUMOR_CORR)
+    compute_spearman_gene_correlation(HEALTHY_FILE, OUT_HEALTHY_CORR)
+
+
+if __name__ == "__main__":
+    main()
