@@ -1,0 +1,170 @@
+import os
+import numpy as np
+import pandas as pd
+
+def build_weighted_graph_from_spearman(
+    spearman_csv: str,
+    out_dir: str,
+    threshold: float | None = None,
+    top_k: int | None = None,
+    make_undirected: bool = True,
+    nan_policy: str = "zero",  # "zero" or "drop"
+) -> dict:
+    """
+    Build a weighted graph from a Spearman correlation matrix.
+
+    Input:
+      spearman_csv: path to square correlation matrix CSV with gene names as index + columns.
+    Output files (written to out_dir):
+      tumor_W.csv      - weighted adjacency matrix W (|rho|, diagonal=0)
+      tumor_P.csv      - random-walk transition matrix P (row-normalized W)
+      tumor_degree.csv - weighted degrees d_i
+      tumor_edges.csv  - edge list: gene_i,gene_j,weight (upper triangle if undirected)
+    Returns:
+      dict with DataFrames: {"W": W_df, "P": P_df, "degree": deg_df, "edges": edges_df}
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- Load correlation matrix ----
+    C = pd.read_csv(spearman_csv, index_col=0)
+    # Ensure columns align with index
+    if list(C.columns) != list(C.index):
+        # Try to reindex columns to index order if same set
+        if set(C.columns) == set(C.index):
+            C = C.loc[C.index, C.index]
+        else:
+            raise ValueError("Correlation matrix must have same gene names in rows and columns.")
+
+    # ---- Handle NaNs ----
+    if C.isna().values.any():
+        if nan_policy == "zero":
+            C = C.fillna(0.0)
+        elif nan_policy == "drop":
+            # Drop any gene with any NaN in its row/col
+            bad = C.index[C.isna().any(axis=1) | C.isna().any(axis=0)]
+            C = C.drop(index=bad, columns=bad)
+        else:
+            raise ValueError("nan_policy must be 'zero' or 'drop'.")
+
+    # ---- Convert to weights ----
+    W = C.abs()
+
+    # ---- Remove self-loops (diagonal) ----
+    np.fill_diagonal(W.values, 0.0)
+
+    # ---- Optional sparsification ----
+    # Use either threshold OR top_k. If both given, threshold is applied first, then top_k.
+    if threshold is not None:
+        # Zero out edges below threshold
+        W = W.where(W >= threshold, 0.0)
+
+    if top_k is not None:
+        if top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        # Keep only top_k strongest edges per node (row-wise)
+        W_values = W.values
+        for i in range(W_values.shape[0]):
+            row = W_values[i, :]
+            if np.count_nonzero(row) <= top_k:
+                continue
+            # indices of values to keep
+            keep_idx = np.argpartition(row, -top_k)[-top_k:]
+            mask = np.ones_like(row, dtype=bool)
+            mask[keep_idx] = False
+            row[mask] = 0.0
+            W_values[i, :] = row
+        W = pd.DataFrame(W_values, index=W.index, columns=W.columns)
+
+    # ---- If undirected, symmetrize ----
+    if make_undirected:
+        # Take max to keep strong edge if one-sided pruning happened (top_k)
+        W = pd.DataFrame(np.maximum(W.values, W.values.T), index=W.index, columns=W.columns)
+
+    # ---- Compute weighted degree ----
+    degree = W.sum(axis=1)
+
+    # ---- Handle zero-degree nodes (important) ----
+    zero_deg = degree[degree <= 0].index.tolist()
+    if zero_deg:
+        # Easiest safe policy: add self-loop probability by setting P_ii = 1 later.
+        # We'll keep them in W (all zeros) and mark them.
+        print(f"[WARN] {len(zero_deg)} nodes have zero degree (no edges). "
+              f"They will get P_ii=1 in the transition matrix. Example: {zero_deg[:5]}")
+
+    # ---- Build transition matrix P ----
+    # P_ij = W_ij / degree_i
+    P = W.div(degree.replace(0, np.nan), axis=0).fillna(0.0)
+
+    # For zero-degree nodes, set self-loop to 1 (so each row sums to 1)
+    for g in zero_deg:
+        P.loc[g, :] = 0.0
+        P.loc[g, g] = 1.0
+
+    # Sanity: rows should sum to ~1
+    row_sums = P.sum(axis=1)
+    if not np.allclose(row_sums.values, 1.0, atol=1e-6):
+        bad_rows = row_sums[(row_sums < 0.999) | (row_sums > 1.001)]
+        print(f"[WARN] Some rows do not sum to 1 after normalization (showing up to 5):\n{bad_rows.head()}")
+
+    # ---- Export matrices ----
+    W_path = os.path.join(out_dir, "tumor_W.csv")
+    P_path = os.path.join(out_dir, "tumor_P.csv")
+    deg_path = os.path.join(out_dir, "tumor_degree.csv")
+    edges_path = os.path.join(out_dir, "tumor_edges.csv")
+
+    W.to_csv(W_path)
+    P.to_csv(P_path)
+    degree.rename("degree").to_csv(deg_path, header=True)
+
+    # ---- Export edge list ----
+    edges = []
+    genes = W.index.to_list()
+    Wv = W.values
+
+    if make_undirected:
+        # Upper triangle only (i<j)
+        for i in range(len(genes)):
+            for j in range(i + 1, len(genes)):
+                w = Wv[i, j]
+                if w > 0:
+                    edges.append((genes[i], genes[j], float(w)))
+    else:
+        # Directed edge list (all i != j)
+        for i in range(len(genes)):
+            for j in range(len(genes)):
+                if i == j:
+                    continue
+                w = Wv[i, j]
+                if w > 0:
+                    edges.append((genes[i], genes[j], float(w)))
+
+    edges_df = pd.DataFrame(edges, columns=["gene_i", "gene_j", "weight"])
+    edges_df.to_csv(edges_path, index=False)
+
+    print("Saved:")
+    print(" -", W_path)
+    print(" -", P_path)
+    print(" -", deg_path)
+    print(" -", edges_path)
+
+    return {"W": W, "P": P, "degree": degree.to_frame("degree"), "edges": edges_df}
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    SPEARMAN_TUMOR_CSV = ROOT / "Tumor_Spearman_GeneCorrelation.csv"
+    OUT_DIR = ROOT / "tumor_graph_k20"
+
+    results = build_weighted_graph_from_spearman(
+        spearman_csv=str(SPEARMAN_TUMOR_CSV),
+        out_dir=str(OUT_DIR),
+        threshold=None,
+        top_k=20,
+        make_undirected=True,
+        nan_policy="zero",
+    )
+

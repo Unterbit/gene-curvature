@@ -1,0 +1,206 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CORR_CSV = r"C:\Users\wynto\OneDrive\Desktop\Gene-Curvature\gene-curvature\Tumor_Spearman_GeneCorrelation.csv"  # your 721x721 spearman matrix
+OUT_DIR = Path(r"C:\Users\wynto\OneDrive\Desktop\Gene-Curvature\gene-curvature\sparsify_sweep_outputs")
+OUT_DIR.mkdir(exist_ok=True)
+
+K_LIST = [5, 10, 15, 20, 30, 40, 50, 70, 100]
+TAU_LIST = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+
+SEED = 42
+
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def load_corr(path):
+    C = pd.read_csv(path, index_col=0)
+    # ensure aligned
+    if set(C.index) != set(C.columns):
+        raise ValueError("Correlation matrix rows/cols do not match.")
+    C = C.loc[C.index, C.index]
+    return C
+
+def corr_to_weight(C):
+    W = C.abs().copy(deep=True)
+    for i in range(W.shape[0]):
+        W.iat[i, i] = 0.0
+    return W
+
+
+def build_knn_graph_from_W(W, k, make_undirected=True):
+    Wv = W.values.copy()
+    n = Wv.shape[0]
+
+    # keep top-k per row
+    for i in range(n):
+        row = Wv[i]
+        if k is None or k >= np.count_nonzero(row):
+            continue
+        keep_idx = np.argpartition(row, -k)[-k:]
+        mask = np.ones(n, dtype=bool)
+        mask[keep_idx] = False
+        row[mask] = 0.0
+        Wv[i] = row
+
+    if make_undirected:
+        Wv = np.maximum(Wv, Wv.T)
+
+    Wk = pd.DataFrame(Wv, index=W.index, columns=W.columns)
+
+    # edge list
+    edges = np.transpose(np.nonzero(np.triu(Wv, 1)))
+    G = nx.Graph()
+    G.add_nodes_from(W.index.tolist())
+    for i, j in edges:
+        G.add_edge(W.index[i], W.index[j], weight=float(Wv[i, j]))
+    return G
+
+def build_threshold_graph_from_W(W, tau, make_undirected=True):
+    Wt = W.where(W >= tau, 0.0)
+    if make_undirected:
+        Wt = pd.DataFrame(np.maximum(Wt.values, Wt.values.T), index=W.index, columns=W.columns)
+
+    Wv = Wt.values
+    edges = np.transpose(np.nonzero(np.triu(Wv, 1)))
+    G = nx.Graph()
+    G.add_nodes_from(W.index.tolist())
+    for i, j in edges:
+        w = Wv[i, j]
+        if w > 0:
+            G.add_edge(W.index[i], W.index[j], weight=float(w))
+    return G
+
+def graph_stats(G):
+    n = G.number_of_nodes()
+    m = G.number_of_edges()
+    degs = np.array([d for _, d in G.degree()])
+    avg_deg = degs.mean() if n else 0
+    med_deg = np.median(degs) if n else 0
+    # connectivity summary
+    if n == 0:
+        return dict(n=0, m=0, avg_deg=0, med_deg=0, n_comp=0, giant_frac=0, connected=False)
+    comps = sorted(nx.connected_components(G), key=len, reverse=True)
+    n_comp = len(comps)
+    giant_frac = len(comps[0]) / n if comps else 0
+    connected = (n_comp == 1)
+    return dict(n=n, m=m, avg_deg=avg_deg, med_deg=med_deg,
+                n_comp=n_comp, giant_frac=giant_frac, connected=connected)
+
+# Hook: replace with your curvature computation
+def curvature_summary(G):
+    """
+    Return a single scalar used for 'stabilization' checks.
+    Replace this with your real curvature pipeline (mean curvature, median, etc).
+    """
+    # placeholder: average weighted clustering as a stand-in summary
+    # (remove once you plug in actual curvature)
+    return nx.average_clustering(G, weight="weight")
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+C = load_corr(CORR_CSV)
+W = corr_to_weight(C)
+
+# 1) |rho| distribution (upper triangle)
+tri = W.values[np.triu_indices(W.shape[0], 1)]
+tri = tri[~np.isnan(tri)]
+plt.figure()
+plt.hist(tri, bins=50)
+plt.xlabel("|rho|")
+plt.ylabel("count")
+plt.title("|rho| distribution (upper triangle)")
+plt.savefig(OUT_DIR / "rho_abs_hist.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# Save some quantiles (useful for defensible threshold picks)
+qs = np.quantile(tri, [0.5, 0.75, 0.9, 0.95, 0.99])
+pd.DataFrame({"quantile":[0.5,0.75,0.9,0.95,0.99], "value":qs}).to_csv(OUT_DIR/"rho_abs_quantiles.csv", index=False)
+
+# 2) Sweep k
+knn_rows = []
+for k in K_LIST:
+    Gk = build_knn_graph_from_W(W, k=k, make_undirected=True)
+    st = graph_stats(Gk)
+    st["k"] = k
+    # stabilization metric (swap to curvature later)
+    st["summary_metric"] = curvature_summary(Gk)
+    knn_rows.append(st)
+
+knn_df = pd.DataFrame(knn_rows)
+knn_df.to_csv(OUT_DIR / "knn_sweep_stats.csv", index=False)
+
+# plots: avg degree & connectivity vs k
+plt.figure()
+plt.plot(knn_df["k"], knn_df["avg_deg"], marker="o")
+plt.xlabel("k (top_k per node)")
+plt.ylabel("average degree")
+plt.title("kNN: average degree vs k")
+plt.savefig(OUT_DIR / "knn_avg_degree_vs_k.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+plt.figure()
+plt.plot(knn_df["k"], knn_df["giant_frac"], marker="o")
+plt.xlabel("k (top_k per node)")
+plt.ylabel("fraction in giant component")
+plt.title("kNN: giant component fraction vs k")
+plt.savefig(OUT_DIR / "knn_giant_frac_vs_k.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+plt.figure()
+plt.plot(knn_df["k"], knn_df["summary_metric"], marker="o")
+plt.xlabel("k (top_k per node)")
+plt.ylabel("summary metric (placeholder)")
+plt.title("kNN: stabilization curve (replace with curvature)")
+plt.savefig(OUT_DIR / "knn_stabilization_vs_k.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+
+# 3) Sweep threshold tau
+tau_rows = []
+for tau in TAU_LIST:
+    Gt = build_threshold_graph_from_W(W, tau=tau, make_undirected=True)
+    st = graph_stats(Gt)
+    st["tau"] = tau
+    st["summary_metric"] = curvature_summary(Gt)
+    tau_rows.append(st)
+
+tau_df = pd.DataFrame(tau_rows)
+tau_df.to_csv(OUT_DIR / "threshold_sweep_stats.csv", index=False)
+
+plt.figure()
+plt.plot(tau_df["tau"], tau_df["avg_deg"], marker="o")
+plt.xlabel("tau (|rho| threshold)")
+plt.ylabel("average degree")
+plt.title("Threshold: average degree vs tau")
+plt.savefig(OUT_DIR / "thr_avg_degree_vs_tau.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+plt.figure()
+plt.plot(tau_df["tau"], tau_df["giant_frac"], marker="o")
+plt.xlabel("tau (|rho| threshold)")
+plt.ylabel("fraction in giant component")
+plt.title("Threshold: giant component fraction vs tau")
+plt.savefig(OUT_DIR / "thr_giant_frac_vs_tau.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+plt.figure()
+plt.plot(tau_df["tau"], tau_df["summary_metric"], marker="o")
+plt.xlabel("tau (|rho| threshold)")
+plt.ylabel("summary metric (placeholder)")
+plt.title("Threshold: stabilization curve (replace with curvature)")
+plt.savefig(OUT_DIR / "thr_stabilization_vs_tau.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print("Done. Outputs in:", OUT_DIR.resolve())
+print("Tip: Replace curvature_summary() with your curvature statistic for true stabilization.")

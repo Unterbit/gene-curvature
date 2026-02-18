@@ -1,0 +1,157 @@
+import pandas as pd
+from pathlib import Path
+
+# =========================
+# CONFIG VALUES
+# =========================
+EXCEL_FILE = r"C:\Users\wynto\OneDrive\Desktop\RNA-Patient-Data.xlsx"
+
+HISEQ_SHEET = "HiSeqV2"
+COSMIC_SHEET = "COSMIC-CancerGenes"
+CLINICAL_SHEET = "TCGA.BRCA.clinicalMatrix"
+
+# Cache files
+CACHE_EXPR = "cache_hiseq_cosmic.csv"      # COSMIC-filtered expression matrix (genes x samples)
+CACHE_META = "cache_sample_meta.csv"       # sample_id -> sample_type mapping
+
+# Outputs (wide matrices)
+OUT_TUMOR_WIDE = "Tumor_expression_matrix_COSMIC.csv"
+OUT_HEALTHY_WIDE = "Healthy_expression_matrix_COSMIC.csv"
+
+
+def find_cosmic_gene_col(cosmic: pd.DataFrame) -> str:
+    for col in cosmic.columns:
+        c = str(col).lower()
+        if "gene" in c and "symbol" in c:
+            return col
+    raise ValueError("Could not find a 'Gene Symbol' column in COSMIC sheet.")
+
+
+def build_sample_type_map_from_clinical_tidy(clin: pd.DataFrame) -> pd.DataFrame:
+    # Normalize column names
+    clin.columns = [str(c).strip() for c in clin.columns]
+
+    # Find sample_type column
+    sample_type_col = None
+    for c in clin.columns:
+        if str(c).strip().lower() == "sample_type":
+            sample_type_col = c
+            break
+    if sample_type_col is None:
+        for c in clin.columns:
+            cl = str(c).lower()
+            if "sample" in cl and "type" in cl:
+                sample_type_col = c
+                break
+    if sample_type_col is None:
+        raise ValueError(
+            "Could not find 'sample_type' in clinical matrix columns.\n"
+            f"First 40 columns I see are:\n{list(clin.columns)[:40]}"
+        )
+
+    # ID column is first column in that sheet
+    id_col = clin.columns[0]
+
+    meta = clin[[id_col, sample_type_col]].copy()
+    meta.columns = ["sample_id", "sample_type"]
+
+    meta["sample_id"] = meta["sample_id"].astype(str).str.strip()
+    meta["sample_type"] = meta["sample_type"].astype(str).str.strip()
+    meta["sample_type"] = meta["sample_type"].replace({"nan": pd.NA, "": pd.NA})
+
+    meta = meta.dropna(subset=["sample_id"]).drop_duplicates(subset=["sample_id"])
+    return meta
+
+
+def build_cache(excel_file: str) -> None:
+    print("Reading Excel (one-time cache build)...")
+
+    hiseq = pd.read_excel(excel_file, sheet_name=HISEQ_SHEET, engine="openpyxl")
+    cosmic = pd.read_excel(excel_file, sheet_name=COSMIC_SHEET, engine="openpyxl")
+
+    # clinicalMatrix header is on Excel row 2 (your screenshot shows row 1 is numbers)
+    clin = pd.read_excel(excel_file, sheet_name=CLINICAL_SHEET, engine="openpyxl", header=1)
+
+    # COSMIC genes set
+    cosmic_gene_col = find_cosmic_gene_col(cosmic)
+    cosmic_genes_set = set(cosmic[cosmic_gene_col].dropna().astype(str).str.strip())
+
+    # Filter HiSeq to COSMIC genes
+    gene_col = hiseq.columns[0]
+    filtered = hiseq[hiseq[gene_col].astype(str).str.strip().isin(cosmic_genes_set)].copy()
+
+    filtered.rename(columns={gene_col: "Gene"}, inplace=True)
+    filtered.set_index("Gene", inplace=True)
+
+    meta = build_sample_type_map_from_clinical_tidy(clin)
+
+    print(f"Saving cached expression matrix -> {CACHE_EXPR}")
+    filtered.to_csv(CACHE_EXPR)
+
+    print(f"Saving cached metadata -> {CACHE_META}")
+    meta.to_csv(CACHE_META, index=False)
+
+    print("Cache built successfully.")
+
+
+def load_cache() -> tuple[pd.DataFrame, pd.DataFrame]:
+    expr = pd.read_csv(CACHE_EXPR, index_col=0)  # Gene index
+    meta = pd.read_csv(CACHE_META)
+
+    meta["sample_id"] = meta["sample_id"].astype(str).str.strip()
+    meta["sample_type"] = meta["sample_type"].astype(str).str.strip()
+    return expr, meta
+
+
+def export_split_matrices(expr: pd.DataFrame, meta: pd.DataFrame) -> None:
+    """
+    Creates two WIDE matrices:
+      - Tumor: Gene rows x sample_id columns where sample_type == "Primary Tumor"
+      - Healthy: Gene rows x sample_id columns where sample_type == "Solid Tissue Normal"
+    """
+
+    # Map sample_id -> sample_type
+    st_map = dict(zip(meta["sample_id"], meta["sample_type"]))
+
+    # Only keep sample_ids that actually exist as columns in expr
+    # (clinical matrix might contain extra IDs not in HiSeq, or vice-versa)
+    tumor_cols = [sid for sid in expr.columns if st_map.get(sid) == "Primary Tumor"]
+    healthy_cols = [sid for sid in expr.columns if st_map.get(sid) == "Solid Tissue Normal"]
+
+    print(f"Found {len(tumor_cols)} Primary Tumor samples.")
+    print(f"Found {len(healthy_cols)} Solid Tissue Normal samples.")
+
+    if len(tumor_cols) == 0:
+        print("WARNING: No tumor samples matched exactly. If this is unexpected, your IDs may not match perfectly.")
+    if len(healthy_cols) == 0:
+        print("WARNING: No healthy samples matched exactly. If this is unexpected, your IDs may not match perfectly.")
+
+    tumor = expr[tumor_cols].copy()
+    healthy = expr[healthy_cols].copy()
+
+    print(f"Writing tumor matrix -> {OUT_TUMOR_WIDE}")
+    tumor.to_csv(OUT_TUMOR_WIDE)
+
+    print(f"Writing healthy matrix -> {OUT_HEALTHY_WIDE}")
+    healthy.to_csv(OUT_HEALTHY_WIDE)
+
+    print("Done.")
+
+
+def main():
+    if not Path(EXCEL_FILE).exists():
+        raise FileNotFoundError(f"Excel file not found: {EXCEL_FILE}")
+
+    # Build cache if missing
+    if not (Path(CACHE_EXPR).exists() and Path(CACHE_META).exists()):
+        build_cache(EXCEL_FILE)
+
+    expr, meta = load_cache()
+
+    # Create Tumor / Healthy matrices (wide)
+    export_split_matrices(expr, meta)
+
+
+if __name__ == "__main__":
+    main()
+
